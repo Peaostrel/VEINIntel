@@ -7,6 +7,18 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeou
 from typing import Generator, Dict, Any
 from config import settings
 from brightdata_client import BrightDataClient
+import sys
+import builtins
+
+def safe_print(*args, **kwargs):
+    try:
+        builtins.print(*args, **kwargs)
+    except UnicodeEncodeError:
+        safe_args = [str(arg).encode('ascii', errors='replace').decode('ascii') for arg in args]
+        builtins.print(*safe_args, **kwargs)
+
+print = safe_print
+
 
 # =====================================================================
 # PREMIUM SANDBOX DATABASE (FALLBACK & SEAMLESS JUDGE DEMOS)
@@ -342,7 +354,6 @@ class GTMResearchAgentPipeline:
             "contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {
                 "temperature": 0.4,
-                "maxOutputTokens": 2048,
                 "responseMimeType": "application/json"  # Force clean JSON output — no markdown, no fences
             }
         }
