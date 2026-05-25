@@ -1,7 +1,9 @@
 import time
 import random
 import json
+import re
 import requests as http_requests
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from typing import Generator, Dict, Any
 from config import settings
 from brightdata_client import BrightDataClient
@@ -333,18 +335,19 @@ class GTMResearchAgentPipeline:
             return []
 
     def _call_gemini(self, prompt: str) -> str:
-        """Call Gemini 1.5 Flash via REST API and return the text response."""
+        """Call Gemini 2.0 Flash via REST API and return the text response."""
         api_key = settings.GEMINI_API_KEY
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}"
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
         payload = {
             "contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {
-                "temperature": 0.7,
+                "temperature": 0.4,
                 "maxOutputTokens": 2048,
+                "responseMimeType": "application/json"  # Force clean JSON output — no markdown, no fences
             }
         }
         try:
-            resp = http_requests.post(url, json=payload, timeout=45)
+            resp = http_requests.post(url, json=payload, timeout=30)
             resp.raise_for_status()
             data = resp.json()
             return data["candidates"][0]["content"]["parts"][0]["text"]
@@ -398,22 +401,44 @@ Make it realistic and data-driven based on the live web snippets. The cold_email
 
         raw_text = self._call_gemini(prompt)
         if not raw_text:
+            print("[AgentEngine] Gemini returned empty response.")
             return None
 
-        # Strip markdown code fences if Gemini adds them
-        cleaned = raw_text.strip()
-        if cleaned.startswith("```"):
-            parts = cleaned.split("```")
-            cleaned = parts[1] if len(parts) > 1 else cleaned
-            if cleaned.startswith("json"):
-                cleaned = cleaned[4:]
-        cleaned = cleaned.strip().rstrip("`").strip()
+        print(f"[AgentEngine] Gemini raw response (first 400 chars): {raw_text[:400]}")
 
+        # --- Strategy 1: try parsing the whole response directly ---
         try:
-            return json.loads(cleaned)
-        except json.JSONDecodeError as e:
-            print(f"[AgentEngine] Failed to parse Gemini JSON: {e}")
-            return None
+            return json.loads(raw_text.strip())
+        except json.JSONDecodeError:
+            pass
+
+        # --- Strategy 2: extract JSON block from markdown fences ```json ... ``` ---
+        fence_match = re.search(r"```(?:json)?\s*({.*?})\s*```", raw_text, re.DOTALL)
+        if fence_match:
+            try:
+                return json.loads(fence_match.group(1))
+            except json.JSONDecodeError as e:
+                print(f"[AgentEngine] Fence block JSON parse failed: {e}")
+
+        # --- Strategy 3: find the outermost { ... } JSON object anywhere in the text ---
+        brace_match = re.search(r"(\{.*\})", raw_text, re.DOTALL)
+        if brace_match:
+            try:
+                return json.loads(brace_match.group(1))
+            except json.JSONDecodeError as e:
+                print(f"[AgentEngine] Brace extraction JSON parse failed: {e}")
+                # Try to find a shorter valid JSON subset
+                candidate = brace_match.group(1)
+                # Walk backwards to find the last valid closing brace
+                for i in range(len(candidate), 0, -1):
+                    if candidate[i-1] == '}':
+                        try:
+                            return json.loads(candidate[:i])
+                        except json.JSONDecodeError:
+                            continue
+
+        print(f"[AgentEngine] All JSON extraction strategies failed. Raw: {raw_text[:200]}")
+        return None
 
     def execute_live(self) -> Generator[str, None, None]:
         """
@@ -438,20 +463,38 @@ Make it realistic and data-driven based on the live web snippets. The cold_email
         yield f"data: {self._log('SEARCH', f'Querying Google SERP API for [{self.domain}] brand and corporate signals...')}\n\n"
 
         if is_live:
+            def _run_all_serp():
+                results = []
+                queries = [
+                    f"{self.domain} company overview pricing product",
+                    f"site:linkedin.com/jobs OR site:greenhouse.io {self.domain} jobs hiring 2025",
+                    f"{self.domain} vs competitors pricing comparison review G2 Capterra"
+                ]
+                labels = ["brand signals", "hiring signals", "competitor intel"]
+                local_snippets = []
+                for q, label in zip(queries, labels):
+                    try:
+                        snips = self._fetch_serp_data(q)
+                        local_snippets.extend(snips)
+                        results.append((label, len(snips)))
+                    except Exception as e:
+                        results.append((label, f"err: {str(e)[:60]}"))
+                return local_snippets, results
+
             try:
-                brand_snippets = self._fetch_serp_data(f"{self.domain} company overview pricing product")
-                serp_snippets.extend(brand_snippets)
-                yield f"data: {self._log('SEARCH', f'SERP API returned {len(brand_snippets)} organic results for brand signals.')}\n\n"
-                time.sleep(0.5)
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(_run_all_serp)
+                    live_snippets, call_results = future.result(timeout=25)  # 25s global cap
+                serp_snippets.extend(live_snippets)
 
-                hiring_snippets = self._fetch_serp_data(f"site:linkedin.com/jobs OR site:greenhouse.io {self.domain} jobs hiring 2025")
-                serp_snippets.extend(hiring_snippets)
-                yield f"data: {self._log('SEARCH', f'Scraped {len(hiring_snippets)} hiring signal records from job boards via SERP API.')}\n\n"
-                time.sleep(0.5)
+                for label, count in call_results:
+                    if isinstance(count, int):
+                        yield f"data: {self._log('SEARCH', f'SERP API — {label}: {count} records extracted.')}\n\n"
+                    else:
+                        yield f"data: {self._log('SEARCH', f'SERP note for {label}: {count}. Fallback data enriched.')}\n\n"
 
-                comp_snippets = self._fetch_serp_data(f"{self.domain} vs competitors pricing comparison review G2 Capterra")
-                serp_snippets.extend(comp_snippets)
-                yield f"data: {self._log('SEARCH', f'Competitor intelligence: {len(comp_snippets)} data points extracted from review sites.')}\n\n"
+            except FuturesTimeoutError:
+                yield f"data: {self._log('SEARCH', 'SERP API taking too long (>25s). Using sandbox enrichment to stay fast.')}\n\n"
             except Exception as e:
                 yield f"data: {self._log('SEARCH', f'SERP note: {str(e)[:80]}. Activating enhanced fallback data.')}\n\n"
         else:
@@ -480,7 +523,7 @@ Make it realistic and data-driven based on the live web snippets. The cold_email
         yield f"data: {self._log('SYNTHESIS', f'Analyzing pain points for buyer personas based on target market focus: [{self.focus_area}]...')}\n\n"
 
         if is_live and serp_snippets:
-            yield f"data: {self._log('SYNTHESIS', f'Sending {len(serp_snippets)} live SERP records to Gemini 1.5 Flash for AI synthesis...')}\n\n"
+            yield f"data: {self._log('SYNTHESIS', f'Sending {len(serp_snippets)} live SERP records to Gemini 2.5 Flash for AI synthesis...')}\n\n"
         else:
             time.sleep(1.5)
 

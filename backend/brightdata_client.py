@@ -12,13 +12,18 @@ class BrightDataClient:
 
     # Bright Data Scraper API endpoint for Google search
     SCRAPER_API_URL = "https://api.brightdata.com/request"
-    SERP_ZONE = "serp"  # Default zone name for SERP product
+    SERP_ZONE = "serp"  # Default zone name — override via BRIGHTDATA_SERP_ZONE in .env
+    SERP_TIMEOUT = (8, 15)  # (connect_timeout, read_timeout) in seconds
 
     def __init__(self):
         self.api_key = settings.BRIGHTDATA_API_KEY
         self.serp_user = settings.BRIGHTDATA_SERP_USER
         self.serp_pass = settings.BRIGHTDATA_SERP_PASS
         self.unlocker_proxy = settings.BRIGHTDATA_UNLOCKER_PROXY
+        # Allow zone name override via env variable
+        zone_override = getattr(settings, 'BRIGHTDATA_SERP_ZONE', None)
+        if zone_override:
+            self.SERP_ZONE = zone_override
 
     def _has_serp_credentials(self) -> bool:
         """Returns True if any usable Bright Data SERP credential is configured."""
@@ -45,7 +50,7 @@ class BrightDataClient:
     def _serp_via_scraper_api(self, query: str, num_results: int) -> dict:
         """
         Use Bright Data's Scraper REST API with Bearer token authentication.
-        This is the modern, recommended approach with structured JSON output.
+        Uses format="raw" as documented in Bright Data's Web Access API curl examples.
         """
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -55,7 +60,7 @@ class BrightDataClient:
         payload = {
             "zone": self.SERP_ZONE,
             "url": f"https://www.google.com/search?q={requests.utils.quote(query)}&num={num_results}&brd_json=1",
-            "format": "json",
+            "format": "raw",
         }
 
         try:
@@ -63,11 +68,27 @@ class BrightDataClient:
                 self.SCRAPER_API_URL,
                 json=payload,
                 headers=headers,
-                timeout=30
+                timeout=self.SERP_TIMEOUT  # (connect, read) — fail fast, don't hang UI
             )
             response.raise_for_status()
-            raw = response.json()
-            return self._normalize_serp_response(raw, query)
+
+            # Bright Data returns either JSON or raw HTML depending on brd_json flag
+            content_type = response.headers.get("Content-Type", "")
+            if "application/json" in content_type:
+                raw = response.json()
+                return self._normalize_serp_response(raw, query)
+            else:
+                # Try to parse as JSON anyway (brd_json=1 may return JSON in raw mode)
+                try:
+                    raw = response.json()
+                    return self._normalize_serp_response(raw, query)
+                except Exception:
+                    # HTML response — extract snippets via regex
+                    return self._parse_html_serp(response.text, query)
+
+        except requests.exceptions.Timeout:
+            print(f"[BrightDataClient] SERP request timed out after {self.SERP_TIMEOUT[1]}s for query: {query[:60]}")
+            raise RuntimeError("Bright Data SERP API timed out — check zone name and API key permissions")
         except requests.exceptions.RequestException as e:
             print(f"[BrightDataClient] Scraper API search error: {e}")
             raise RuntimeError(f"Bright Data Scraper API request failed: {e}")
